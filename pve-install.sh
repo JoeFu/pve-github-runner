@@ -119,8 +119,13 @@ mkdir -p "$work"
 
 # --- what goes into the VM -------------------------------------------------------------------
 
-here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo .)")
-if [[ -f $here/runner-setup.sh && $here != /dev/* && $here != /proc/* ]]; then
+# Run from a checkout, it uses the runner-setup.sh next to it; run as bash -c "$(curl ...)",
+# there is no file (and no BASH_SOURCE), so it downloads the one from the same place.
+here=''
+if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then
+    here=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+fi
+if [[ -n $here && -f $here/runner-setup.sh ]]; then
     cp "$here/runner-setup.sh" "$work/runner-setup.sh"
 else
     curl -fsSL "$SOURCE/runner-setup.sh" -o "$work/runner-setup.sh" || die "can't download $SOURCE/runner-setup.sh"
