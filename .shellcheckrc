@@ -1,0 +1,2 @@
+# The single-quoted strings handed to json() are Perl, not shell.
+disable=SC2016
