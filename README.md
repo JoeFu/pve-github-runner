@@ -42,8 +42,8 @@ runs-on: ${{ vars.NIA_RUNNER || 'ubuntu-24.04' }}
 在虚拟机里（`runner-setup.sh`）：
 
 - 装好 GitHub `ubuntu-24.04` 镜像里有、但 setup action 不会替你装的东西：git、gh、jq、zip、python3、build-essential、Docker + buildx、QEMU + OVMF。Node、Python 版本、uv、pnpm 这些由各自的 setup action 安装。
-- 建 `runner` 用户（docker、kvm 组，免密 sudo，和 GitHub 的 runner 一样）。
 - 下载最新的 actions runner，核对 SHA256，注册 N 个实例（`gh-runner-1`、`gh-runner-2`……），装成 systemd 服务。
+- 每个实例用自己的用户（`runner-1`、`runner-2`……，都在 docker、kvm 组，免密 sudo，和 GitHub 的 runner 一样）。GitHub 给每个 job 一台单独的机器；这里同时跑的几个 job 至少不共用家目录，setup action 装在 `~` 下的东西（pnpm 和它的 store、uv 的缓存等）不会被另一个 job 中途改掉。Docker 和 KVM 仍然共用。
 - 每周清理一次一周前的 Docker 镜像和构建缓存。
 
 `runner-setup.sh` 也可以单独在任何 Ubuntu 24.04 x64 机器上用，见文件开头的说明。重复运行是安全的。
@@ -73,6 +73,7 @@ runs-on: ${{ vars.NIA_RUNNER || 'ubuntu-24.04' }}
 - 虚拟机关着时 job 会排队，最多等 24 小时。
 - 想让 job 里能跑 KVM，PVE 主机要开嵌套虚拟化（较新的内核默认开启），脚本会检查并提示。
 - 加 runner：在虚拟机里用更大的 `RUNNER_COUNT` 再跑一次 `runner-setup.sh`（命令在安装结束时会打印）。
+- 以前装的（所有实例共用一个 `runner` 用户）：在虚拟机里再跑一次 `runner-setup.sh`，不用注册令牌。每个实例会搬到自己的用户下，注册信息保留，服务会重启一下，所以最好在没有 job 的时候跑。跑完它会打印删掉旧 `runner` 用户的命令。
 - 移除：在 GitHub 的 Settings → Actions → Runners 里删掉 runner（离线 14 天后 GitHub 也会自动删），再在 PVE 里删掉虚拟机。
 - GitHub 曾宣布对自托管 runner 按分钟收费，后来推迟了；用之前看一下当前的计费说明。
 

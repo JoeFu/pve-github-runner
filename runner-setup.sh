@@ -16,14 +16,20 @@
 #   RUNNER_NAME     name prefix: <prefix>-1, <prefix>-2, ...                    (default: hostname)
 #   LABELS          extra labels, comma-separated; self-hosted, linux and x64 are always there
 #   RUNNER_GROUP    the organization runner group                               (default: Default)
-#   RUNNER_USER     the account the runners run as                              (default runner)
+#   RUNNER_USER     account prefix: runner <prefix>-1 runs as <prefix>-1, ...  (default runner)
+#
+# Each runner has an account of its own, as on GitHub each job has a machine of its own: jobs
+# that run side by side don't share a home, so what setup actions put under ~ (pnpm and its
+# store, uv's cache, ...) is never changed by another job halfway through. Docker and KVM are
+# still shared.
 #
 # Running it again is safe: it installs what is missing, registers runners that aren't
-# registered yet and leaves the others alone.
+# registered yet and leaves the others alone. Runners set up by an older version, all as one
+# account, are moved to their own accounts (they stop for a moment; better while no job runs).
 #
 # Besides the runner it installs what GitHub's ubuntu-24.04 image has that setup actions don't
 # install for you: git, gh, jq, zip, python3, build-essential, Docker with buildx, and QEMU with
-# OVMF and KVM (for jobs that boot VMs). Like GitHub's runners, the runner account may sudo
+# OVMF and KVM (for jobs that boot VMs). Like GitHub's runners, the runner accounts may sudo
 # without a password, so only use it for repositories whose pull requests you trust.
 set -euo pipefail
 
@@ -67,11 +73,13 @@ if ! command -v gh >/dev/null; then
     apt-get install -y -q gh
 fi
 
-say "User $RUNNER_USER"
-id "$RUNNER_USER" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$RUNNER_USER"
-usermod -aG docker,kvm "$RUNNER_USER"
-echo "$RUNNER_USER ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$RUNNER_USER"
-chmod 0440 "/etc/sudoers.d/90-$RUNNER_USER"
+add_user() {
+    id "$1" >/dev/null 2>&1 || useradd --create-home --shell /bin/bash "$1"
+    usermod -aG docker,kvm "$1"
+    echo "$1 ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/90-$1"
+    chmod 0440 "/etc/sudoers.d/90-$1"
+}
+
 if [[ -e /dev/kvm ]]; then
     echo "KVM: yes"
 else
@@ -83,7 +91,7 @@ tag=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | j
 version=${tag#v}
 tarball=actions-runner-linux-x64-$version.tar.gz
 cache=$RUNNER_ROOT/$tarball
-install -d -o "$RUNNER_USER" -g "$RUNNER_USER" "$RUNNER_ROOT"
+install -d -m 0755 "$RUNNER_ROOT"
 if [[ ! -f $cache ]]; then
     curl -fsSL -o "$cache.part" "https://github.com/actions/runner/releases/download/$tag/$tarball"
     # The release notes carry each package's SHA-256 between these markers.
@@ -103,27 +111,49 @@ extra=()
 [[ -n $LABELS ]] && extra+=(--labels "$LABELS")
 [[ -n $RUNNER_GROUP ]] && extra+=(--runnergroup "$RUNNER_GROUP")
 deps_done=
+old_users=()
 for i in $(seq 1 "$RUNNER_COUNT"); do
     dir=$RUNNER_ROOT/r$i
     name=$RUNNER_NAME-$i
+    user=$RUNNER_USER-$i
+    add_user "$user"
     if [[ -f $dir/.runner ]]; then
-        echo "$name: registered already"
+        owner=$(stat -c %U "$dir")
+        if [[ $owner != "$user" ]]; then
+            # Set up by an older version, as an account shared by every runner. Its
+            # registration lives in the folder, so handing the folder over keeps it.
+            echo "$name: moving from $owner to $user"
+            (
+                cd "$dir"
+                ./svc.sh stop >/dev/null 2>&1 || true
+                ./svc.sh uninstall >/dev/null
+            )
+            chown -R "$user:$user" "$dir"
+            [[ " ${old_users[*]} " == *" $owner "* ]] || old_users+=("$owner")
+        else
+            echo "$name: registered already"
+        fi
     else
         [[ -n ${RUNNER_TOKEN:-} ]] || die "RUNNER_TOKEN is needed to register $name"
-        install -d -o "$RUNNER_USER" -g "$RUNNER_USER" "$dir"
-        sudo -u "$RUNNER_USER" tar -xzf "$cache" -C "$dir"
+        install -d -o "$user" -g "$user" "$dir"
+        sudo -u "$user" tar -xzf "$cache" -C "$dir"
         if [[ -z $deps_done ]]; then
             "$dir/bin/installdependencies.sh" >/dev/null
             deps_done=1
         fi
-        sudo -u "$RUNNER_USER" "$dir/config.sh" --unattended --replace \
+        sudo -u "$user" "$dir/config.sh" --unattended --replace \
             --url "$RUNNER_URL" --token "$RUNNER_TOKEN" --name "$name" --work _work "${extra[@]}"
     fi
     if ! compgen -G "/etc/systemd/system/actions.runner.*.$name.service" >/dev/null; then
-        (cd "$dir" && ./svc.sh install "$RUNNER_USER" >/dev/null)
+        (cd "$dir" && ./svc.sh install "$user" >/dev/null)
     fi
     (cd "$dir" && ./svc.sh start >/dev/null)
-    echo "$name: running"
+    echo "$name: running as $user"
+done
+
+for u in "${old_users[@]}"; do
+    echo "note: no runner runs as $u any more. To remove the account and what jobs left in its home:"
+    echo "  userdel -r $u && rm -f /etc/sudoers.d/90-$u"
 done
 
 say "Weekly Docker cleanup"
