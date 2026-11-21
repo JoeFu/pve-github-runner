@@ -38,6 +38,7 @@ runs-on: ${{ vars.NIA_RUNNER || 'ubuntu-24.04' }}
 2. 新建虚拟机：CPU 类型 `host`（虚拟机里有 KVM，可以再跑虚拟机）、默认 4 核 / 8 GB / 100 GB、DHCP、开机自启、开 guest agent，标签 `github-runner`。主机 root 的 SSH 公钥会放进虚拟机的 `ubuntu` 用户。
 3. 通过 cloud-init 装 guest agent 并放入 `runner-setup.sh`。没有存储允许 snippets 时，会给 `local` 加上 snippets（运行前会提示）。
 4. 等 guest agent 上线后，通过它把注册令牌交给虚拟机里的 `runner-setup.sh`。令牌不会写进 cloud-init 文件。
+5. 主机上有 Intel 板载网卡（驱动 `e1000e`，比如 I219）时，关掉它的 TSO/GSO，并写一条 udev 规则，让它每次开机都关着。见下面「要知道的」。
 
 在虚拟机里（`runner-setup.sh`）：
 
@@ -64,13 +65,22 @@ runs-on: ${{ vars.NIA_RUNNER || 'ubuntu-24.04' }}
 | `--storage ID` | local-lvm | 磁盘放在哪个存储 |
 | `--bridge BRIDGE` / `--vlan TAG` | vmbr0 | 网络 |
 | `--disk SIZE` / `--cores N` / `--memory MIB` | 100G / 4 / 8192 | |
+| `--disk-cache MODE` | unsafe | 磁盘的缓存模式，见下面「要知道的」；`none` 是 PVE 自己的默认 |
 | `--ssh-key FILE` | `/root/.ssh/authorized_keys` | 放进虚拟机的公钥 |
+| `--no-nic-fix` | | 不改主机的 e1000e 网卡 |
 | `--yes` | | 不确认直接建 |
 
 ## 要知道的
 
 - **只给你信任的仓库用。** runner 用户能免密 sudo，job 能在这台虚拟机上做任何事。公开仓库收到陌生人的 PR 就能在你的网络里跑代码；仓库要公开之前，先移除 runner。
 - 虚拟机关着时 job 会排队，最多等 24 小时。
+- **Intel 板载网卡（`e1000e`）会卡死。** I219 这类网卡在 Linux 上、桥接着忙碌的虚拟机时，会在大流量下卡住（内核日志里是 `Detected Hardware Unit Hang`），主机和所有虚拟机一起断网，往往只能重启。机器放在远端机房时尤其麻烦。`pve-install.sh` 检测到这种网卡，会关掉它的 TSO/GSO（改由 CPU 切分数据包，千兆网下几乎不费力），并写入 `/etc/udev/rules.d/90-pve-github-runner-e1000e.rules`，重启和内核升级后仍然有效。重装 PVE 后再跑一次 `pve-install.sh`，修复就回来了。想在已经装好的主机上单独做这一步：
+  ```bash
+  ethtool -K eno1 tso off gso off
+  echo 'ACTION=="add", SUBSYSTEM=="net", DRIVERS=="e1000e", RUN+="/usr/sbin/ethtool -K $name tso off gso off"' > /etc/udev/rules.d/90-pve-github-runner-e1000e.rules
+  ```
+  （`eno1` 换成你的网卡名，`ip -br link` 可以看到。）彻底的办法是换一块不用 `e1000e` 的 PCIe 网卡，比如 Intel I210 或 I226。
+- **磁盘默认用 `cache=unsafe`。** 虚拟机里的 fsync 不再等 SSD 确认。消费级 SSD 上每次确认要十毫秒左右，大量读写数据库的测试（比如每个用例建一个 SQLite 库）会因此慢好几倍：实测 200 次 SQLite 提交从 1.98 秒降到 0.1 秒。代价是 PVE 主机突然断电或死机时，这台虚拟机的磁盘可能损坏，那就删掉重建。虚拟机自己重启或崩溃没有影响。不想要就加 `--disk-cache none`。已有的虚拟机：`qm set <vmid> --scsi0 <原来的值>,cache=unsafe`，然后关机再开机。
 - 想让 job 里能跑 KVM，PVE 主机要开嵌套虚拟化（较新的内核默认开启），脚本会检查并提示。
 - 加 runner：在虚拟机里用更大的 `RUNNER_COUNT` 再跑一次 `runner-setup.sh`（命令在安装结束时会打印）。
 - 以前装的（所有实例共用一个 `runner` 用户）：在虚拟机里再跑一次 `runner-setup.sh`，不用注册令牌。每个实例会搬到自己的用户下，注册信息保留，服务会重启一下，所以最好在没有 job 的时候跑。跑完它会打印删掉旧 `runner` 用户的命令。

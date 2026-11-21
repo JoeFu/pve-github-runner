@@ -29,10 +29,21 @@
 #   --bridge BRIDGE     network bridge (default vmbr0)
 #   --vlan TAG          VLAN tag on that bridge
 #   --disk SIZE         disk size (default 100G)
+#   --disk-cache MODE   the disk's cache mode (default unsafe): a guest's fsync isn't passed on to
+#                       the SSD, which makes database-heavy tests several times faster; if this
+#                       host loses power the VM's disk may be damaged, and you create it again.
+#                       Pass none for Proxmox's own default.
 #   --cores N           (default 4)
 #   --memory MIB        (default 8192)
 #   --ssh-key FILE      public keys for the VM's "ubuntu" user (default: root's on this host)
+#   --no-nic-fix        leave Intel e1000e network cards as they are (see below)
 #   --yes               don't ask before creating the VM
+#
+# This host: Intel's onboard I219 cards (driver e1000e) hang under the traffic of busy VMs
+# ("Detected Hardware Unit Hang"), taking the host and every VM off the network until it is
+# restarted. If this host has one, TCP/generic segmentation offload is turned off on it now and,
+# by a udev rule, every time it appears; the CPU does that work instead. Run this again after
+# reinstalling Proxmox VE and the fix is back.
 set -euo pipefail
 
 SOURCE=${PGR_SOURCE:-https://raw.githubusercontent.com/JoeFu/pve-github-runner/main}
@@ -40,7 +51,7 @@ IMAGE_URL=https://cloud-images.ubuntu.com/noble/current
 IMAGE=noble-server-cloudimg-amd64.img
 
 repo='' org='' token='' count=3 labels='' group='' set_variable='' vmid='' name=gh-runner storage=''
-bridge=vmbr0 vlan='' disk=100G cores=4 memory=8192 ssh_key='' yes=''
+bridge=vmbr0 vlan='' disk=100G disk_cache=unsafe cores=4 memory=8192 ssh_key='' nic_fix=1 yes=''
 while (( $# )); do
     case $1 in
         --repo) repo=$2; shift 2 ;;
@@ -56,11 +67,13 @@ while (( $# )); do
         --bridge) bridge=$2; shift 2 ;;
         --vlan) vlan=$2; shift 2 ;;
         --disk) disk=$2; shift 2 ;;
+        --disk-cache) disk_cache=$2; shift 2 ;;
         --cores) cores=$2; shift 2 ;;
         --memory) memory=$2; shift 2 ;;
         --ssh-key) ssh_key=$2; shift 2 ;;
+        --no-nic-fix) nic_fix=''; shift ;;
         --yes|-y) yes=1; shift ;;
-        -h|--help) sed -n '2,36p' "$0" 2>/dev/null || true; exit 0 ;;
+        -h|--help) sed -n '2,46p' "$0" 2>/dev/null || true; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -86,6 +99,7 @@ else
 fi
 [[ $count =~ ^[1-9][0-9]*$ ]] || die "--count must be a positive number"
 [[ $name =~ ^[A-Za-z0-9-]+$ ]] || die "--name may only have letters, digits and dashes"
+[[ $disk_cache =~ ^(unsafe|none|writeback|writethrough|directsync)$ ]] || die "--disk-cache must be unsafe, none, writeback, writethrough or directsync"
 [[ -z $set_variable || ( -n $repo && -n ${GITHUB_TOKEN:-} ) ]] || die "--set-variable needs --repo and GITHUB_TOKEN"
 
 json() {  # json EXPR < JSON: a value from JSON, with Perl's core JSON::PP (always on Proxmox VE)
@@ -165,15 +179,39 @@ keys=${ssh_key:-/root/.ssh/authorized_keys}
 [[ -n $ssh_key && ! -f $ssh_key ]] && die "no such file: $ssh_key"
 [[ -f $keys ]] || keys=
 
+# Network cards driven by e1000e (see the top of this file).
+e1000e=()
+if [[ -n $nic_fix ]]; then
+    for dev in /sys/class/net/*; do
+        [[ -e $dev/device/driver ]] || continue
+        [[ $(basename "$(readlink -f "$dev/device/driver")") == e1000e ]] && e1000e+=("${dev##*/}")
+    done
+fi
+
 say "Runners for $url"
 echo "  VM $vmid \"$name\": $cores cores (host), $memory MiB, $disk disk on $storage, network $bridge${vlan:+ (VLAN $vlan)}"
 echo "  $count runner(s): $name-1 ... $name-$count${labels:+, labels $labels}"
 [[ -n $keys ]] && echo "  ssh: ubuntu@<its address>, with the keys in $keys"
 [[ -n $add_snippets ]] && echo "  the storage \"local\" will also allow snippets (for cloud-init)"
 [[ -n $set_variable ]] && echo "  then the repository variable $set_variable = self-hosted"
+(( ${#e1000e[@]} )) && echo "  this host's Intel e1000e card (${e1000e[*]}): segmentation offload off, now and at every boot"
 if [[ -z $yes ]]; then
     read -r -p "Create and start it? [Y/n] " answer
     [[ -z $answer || $answer == [Yy]* ]] || exit 0
+fi
+
+if (( ${#e1000e[@]} )); then
+    command -v ethtool >/dev/null || apt-get install -y -q ethtool >/dev/null
+    ethtool=$(command -v ethtool)
+    cat > /etc/udev/rules.d/90-pve-github-runner-e1000e.rules <<RULE
+# pve-github-runner: Intel I219 cards (e1000e) hang under VM traffic with segmentation offload
+# on ("Detected Hardware Unit Hang"); turn it off whenever such a card appears.
+ACTION=="add", SUBSYSTEM=="net", DRIVERS=="e1000e", RUN+="$ethtool -K \$name tso off gso off"
+RULE
+    for nic in "${e1000e[@]}"; do
+        "$ethtool" -K "$nic" tso off gso off
+    done
+    echo "e1000e: segmentation offload is off on ${e1000e[*]}"
 fi
 
 if [[ -n $add_snippets ]]; then
@@ -201,7 +239,7 @@ net="virtio,bridge=$bridge${vlan:+,tag=$vlan}"
 qm create "$vmid" --name "$name" --ostype l26 --machine q35 \
     --cpu host --cores "$cores" --memory "$memory" --balloon 0 \
     --scsihw virtio-scsi-single --net0 "$net" \
-    --scsi0 "$storage:0,import-from=$work/$IMAGE,discard=on,ssd=1,iothread=1" \
+    --scsi0 "$storage:0,import-from=$work/$IMAGE,discard=on,ssd=1,iothread=1,cache=$disk_cache" \
     --ide2 "$storage:cloudinit" --boot order=scsi0 --serial0 socket \
     --agent enabled=1 --onboot 1 --tags github-runner \
     --ipconfig0 ip=dhcp --cicustom "vendor=$snippets:snippets/$snippet" \
